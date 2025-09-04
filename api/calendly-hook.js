@@ -1,4 +1,4 @@
-// /api/calendly-hook.js (Vercel serverless; Node 18+)
+// /api/calendly-hook.js
 function json(res, code, obj) {
   res.statusCode = code;
   res.setHeader('Content-Type', 'application/json');
@@ -21,8 +21,10 @@ export default async function handler(req, res) {
       return json(res, 400, { ok:false, error:'inviteeUri, eventUri, email are required' });
     }
 
-    // ---- Calendly API (follow URIs received from embed message) ----
-    const CAL_AUTH = `Bearer ${process.env.CALENDLY_PAT}`;
+    // ---- Calendly API ----
+    const token = (process.env.CALENDLY_PAT || '').trim();
+    if (!token) return json(res, 500, { ok:false, error:'Missing CALENDLY_PAT env var' });
+    const CAL_AUTH = `Bearer ${token}`;
 
     const invRes = await fetch(inviteeUri, { headers: { Authorization: CAL_AUTH } });
     if (!invRes.ok) throw new Error(`Calendly invitee error ${invRes.status}`);
@@ -32,11 +34,18 @@ export default async function handler(req, res) {
     if (!evtRes.ok) throw new Error(`Calendly event error ${evtRes.status}`);
     const evt = await evtRes.json();
 
-    const startISO   = evt?.resource?.start_time || null;
-    const surveyDate = startISO ? String(startISO).slice(0, 10) : null;
-
-    const payment = inv?.resource?.payment || null; // present if Calendly Payments (Stripe) is on for that event type
-    const paid    = !!(payment && (payment.amount || payment.external_id || payment.provider));
+    // Extract date/time + payment
+    const startISO = evt?.resource?.start_time || null;               // UTC ISO
+    const tz       = inv?.resource?.timezone || evt?.resource?.timezone || 'UTC';
+    let startLocal = null;
+    if (startISO) {
+      try { startLocal = new Date(startISO).toLocaleString('en-GB', { timeZone: tz }); } catch {}
+    }
+    const surveyDate = startISO ? String(startISO).slice(0, 10) : null; // YYYY-MM-DD (for SF date field)
+    const payment    = inv?.resource?.payment || null;
+    const paid       = !!(payment && (payment.amount || payment.external_id || payment.provider));
+    const amount     = payment?.amount ?? null;
+    const currency   = payment?.currency ?? null;
 
     // ---- Salesforce auth ----
     const loginUrl   = process.env.SF_LOGIN_URL || 'https://login.salesforce.com';
@@ -47,13 +56,13 @@ export default async function handler(req, res) {
       const body = new URLSearchParams({
         grant_type: 'client_credentials',
         client_id: process.env.SF_CLIENT_ID,
-        client_secret: process.env.SF_CLIENT_SECRET
+        client_secret: process.env.SF_CLIENT_SECRET,
+        ...(process.env.SF_AUDIENCE ? { audience: process.env.SF_AUDIENCE } : {})
       });
       const r = await fetch(url, { method: 'POST', body });
       if (!r.ok) throw new Error(`SF token (client_credentials) ${r.status}`);
       return r.json();
     }
-
     async function sfTokenPassword() {
       const url = `${loginUrl}/services/oauth2/token`;
       const body = new URLSearchParams({
@@ -70,33 +79,40 @@ export default async function handler(req, res) {
 
     const flow = (process.env.SF_AUTH_FLOW || 'client_credentials').toLowerCase();
     const tok  = flow === 'password' ? await sfTokenPassword() : await sfTokenClientCredentials();
-    const { access_token, instance_url } = tok;
-    if (!access_token || !instance_url) throw new Error('Missing Salesforce token/instance');
 
-    // ---- Find latest Lead by email ----
+    const access_token = tok.access_token;
+    const base = tok.instance_url || process.env.SF_INSTANCE_URL; // fallback for client_credentials
+    if (!access_token) throw new Error('Missing Salesforce access_token');
+    if (!base) throw new Error('Missing Salesforce instance_url (set SF_INSTANCE_URL)');
+
+    // ---- Find Lead by email ----
     const safeEmail = email.replace(/'/g, "\\'");
     const soql = `SELECT Id FROM Lead WHERE Email = '${safeEmail}' ORDER BY CreatedDate DESC LIMIT 1`;
-    const qUrl = `${instance_url}/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`;
+    const qUrl = `${base}/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`;
     const qRes = await fetch(qUrl, { headers: { Authorization: `Bearer ${access_token}` } });
     if (!qRes.ok) throw new Error(`SF query error ${qRes.status}`);
     const q = await qRes.json();
     const leadId = q?.records?.[0]?.Id || null;
-    if (!leadId) return json(res, 404, { ok:false, error:'Lead not found by email' });
+    if (!leadId) return json(res, 404, { ok:false, error:'Lead not found by email', startTime:startISO, eventTimezone:tz, startTimeLocal:startLocal, surveyDate, paid, amount, currency });
 
-    // ---- Update Lead custom fields (client's API names) ----
-    const patchUrl  = `${instance_url}/services/data/${apiVersion}/sobjects/Lead/${leadId}`;
+    // ---- Update Lead ----
+    const patchUrl  = `${base}/services/data/${apiVersion}/sobjects/Lead/${leadId}`;
     const patchBody = {
-      "Survey_scheduled__c": surveyDate || "",
-      "Survey_payment_complete__c": !!paid
+      Survey_scheduled__c: surveyDate || "",
+      Survey_payment_complete__c: !!paid
     };
     const pRes = await fetch(patchUrl, {
       method: 'PATCH',
       headers: { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(patchBody)
     });
-    if (!pRes.ok) throw new Error(`SF patch error ${pRes.status} ${await pRes.text()}`);
+    if (!pRes.ok) {
+      const body = await pRes.text().catch(()=> '');
+      return json(res, 500, { ok:false, error:`SF patch error ${pRes.status}`, details: body.slice(0,400), startTime:startISO, eventTimezone:tz, startTimeLocal:startLocal, surveyDate, paid, amount, currency });
+    }
 
-    return json(res, 200, { ok:true, surveyDate, paid });
+    // Return rich details for console visibility
+    return json(res, 200, { ok:true, startTime:startISO, eventTimezone:tz, startTimeLocal:startLocal, surveyDate, paid, amount, currency });
   } catch (err) {
     console.error('calendly-hook error:', err);
     return json(res, 500, { ok:false, error:String(err.message || err) });
