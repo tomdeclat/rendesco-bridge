@@ -1,0 +1,6 @@
+{
+  "name": "rendesco-bridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "18.x" }
+}
