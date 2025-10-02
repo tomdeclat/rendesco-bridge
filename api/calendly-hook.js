@@ -35,13 +35,13 @@ export default async function handler(req, res) {
     const evt = await evtRes.json();
 
     // Extract date/time + payment
-    const startISO = evt?.resource?.start_time || null;               // UTC ISO
+    const startISO = evt?.resource?.start_time || null;
     const tz       = inv?.resource?.timezone || evt?.resource?.timezone || 'UTC';
     let startLocal = null;
     if (startISO) {
       try { startLocal = new Date(startISO).toLocaleString('en-GB', { timeZone: tz }); } catch {}
     }
-    const surveyDate = startISO ? String(startISO).slice(0, 10) : null; // YYYY-MM-DD (for SF date field)
+    const surveyDate = startISO ? String(startISO).slice(0, 10) : null;
     const payment    = inv?.resource?.payment || null;
     const paid       = !!(payment && (payment.amount || payment.external_id || payment.provider));
     const amount     = payment?.amount ?? null;
@@ -81,19 +81,52 @@ export default async function handler(req, res) {
     const tok  = flow === 'password' ? await sfTokenPassword() : await sfTokenClientCredentials();
 
     const access_token = tok.access_token;
-    const base = tok.instance_url || process.env.SF_INSTANCE_URL; // fallback for client_credentials
+    const base = tok.instance_url || process.env.SF_INSTANCE_URL;
     if (!access_token) throw new Error('Missing Salesforce access_token');
     if (!base) throw new Error('Missing Salesforce instance_url (set SF_INSTANCE_URL)');
 
-    // ---- Find Lead by email ----
+    // ---- Find Lead by email WITH RETRY LOGIC ----
     const safeEmail = email.replace(/'/g, "\\'");
     const soql = `SELECT Id FROM Lead WHERE Email = '${safeEmail}' ORDER BY CreatedDate DESC LIMIT 1`;
     const qUrl = `${base}/services/data/${apiVersion}/query?q=${encodeURIComponent(soql)}`;
-    const qRes = await fetch(qUrl, { headers: { Authorization: `Bearer ${access_token}` } });
-    if (!qRes.ok) throw new Error(`SF query error ${qRes.status}`);
-    const q = await qRes.json();
-    const leadId = q?.records?.[0]?.Id || null;
-    if (!leadId) return json(res, 404, { ok:false, error:'Lead not found by email', startTime:startISO, eventTimezone:tz, startTimeLocal:startLocal, surveyDate, paid, amount, currency });
+    
+    let leadId = null;
+    const maxAttempts = 5;
+    
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`Searching for lead (attempt ${attempt}/${maxAttempts})...`);
+      
+      const qRes = await fetch(qUrl, { headers: { Authorization: `Bearer ${access_token}` } });
+      if (!qRes.ok) throw new Error(`SF query error ${qRes.status}`);
+      const q = await qRes.json();
+      leadId = q?.records?.[0]?.Id || null;
+      
+      if (leadId) {
+        console.log(`Lead found on attempt ${attempt}: ${leadId}`);
+        break;
+      }
+      
+      // If not found and more attempts remain, wait before retry
+      if (attempt < maxAttempts) {
+        const delayMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s, 16s, 32s
+        console.log(`Lead not found, waiting ${delayMs}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
+    
+    if (!leadId) {
+      return json(res, 404, { 
+        ok: false, 
+        error: `Lead not found by email after ${maxAttempts} attempts`, 
+        startTime: startISO, 
+        eventTimezone: tz, 
+        startTimeLocal: startLocal, 
+        surveyDate, 
+        paid, 
+        amount, 
+        currency 
+      });
+    }
 
     // ---- Update Lead ----
     const patchUrl  = `${base}/services/data/${apiVersion}/sobjects/Lead/${leadId}`;
@@ -108,13 +141,34 @@ export default async function handler(req, res) {
     });
     if (!pRes.ok) {
       const body = await pRes.text().catch(()=> '');
-      return json(res, 500, { ok:false, error:`SF patch error ${pRes.status}`, details: body.slice(0,400), startTime:startISO, eventTimezone:tz, startTimeLocal:startLocal, surveyDate, paid, amount, currency });
+      return json(res, 500, { 
+        ok: false, 
+        error: `SF patch error ${pRes.status}`, 
+        details: body.slice(0,400), 
+        startTime: startISO, 
+        eventTimezone: tz, 
+        startTimeLocal: startLocal, 
+        surveyDate, 
+        paid, 
+        amount, 
+        currency 
+      });
     }
 
     // Return rich details for console visibility
-    return json(res, 200, { ok:true, startTime:startISO, eventTimezone:tz, startTimeLocal:startLocal, surveyDate, paid, amount, currency });
+    return json(res, 200, { 
+      ok: true, 
+      startTime: startISO, 
+      eventTimezone: tz, 
+      startTimeLocal: startLocal, 
+      surveyDate, 
+      paid, 
+      amount, 
+      currency,
+      leadId 
+    });
   } catch (err) {
     console.error('calendly-hook error:', err);
-    return json(res, 500, { ok:false, error:String(err.message || err) });
+    return json(res, 500, { ok: false, error: String(err.message || err) });
   }
 }
