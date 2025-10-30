@@ -1,5 +1,6 @@
 // /api/calendly-hook.js
-// Fixed version for Vercel deployment at rendesco-bridge
+// Version 2: Fixed to handle Calendly's actual webhook payload format
+// The invitee data is embedded in the payload, not sent as a separate URI
 
 function json(res, code, obj) {
   res.statusCode = code;
@@ -69,7 +70,6 @@ export default async function handler(req, res) {
     }
 
     // Parse Calendly webhook payload
-    // Calendly sends: { event: "invitee.created", payload: { event: "...", invitee: "..." } }
     console.log('Raw webhook payload:', JSON.stringify(webhookData, null, 2));
 
     const eventType = webhookData.event;
@@ -80,24 +80,41 @@ export default async function handler(req, res) {
       return json(res, 200, { ok: true, message: 'Event type not processed' });
     }
 
-    // Extract URIs from Calendly payload
+    // NEW: Extract data directly from payload
+    // Calendly embeds the invitee data in the payload instead of providing a separate URI
     const eventUri = payload.event;
-    const inviteeUri = payload.invitee;
-
-    if (!eventUri || !inviteeUri) {
-      console.error('❌ Missing event or invitee URI in payload');
+    const email = payload.email;
+    
+    if (!eventUri) {
+      console.error('❌ Missing event URI in payload');
       return json(res, 400, { 
         ok: false, 
-        error: 'Missing event or invitee URI',
+        error: 'Missing event URI',
+        receivedPayload: webhookData
+      });
+    }
+
+    if (!email) {
+      console.error('❌ Missing email in payload');
+      return json(res, 400, { 
+        ok: false, 
+        error: 'Missing email in payload',
         receivedPayload: webhookData
       });
     }
 
     console.log(`📅 Event URI: ${eventUri}`);
-    console.log(`👤 Invitee URI: ${inviteeUri}`);
+    console.log(`📧 Email: ${email}`);
+
+    // Extract invitee data from payload (no API call needed for invitee)
+    const firstName = payload.first_name || '';
+    const lastName = payload.last_name || '';
+    const timezone = payload.timezone || 'UTC';
+
+    console.log(`👤 Invitee: ${firstName} ${lastName}`.trim() || '(No name provided)');
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // CALENDLY API - Fetch booking details
+    // CALENDLY API - Fetch event details only (invitee data already in payload)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const token = (process.env.CALENDLY_PAT || '').trim();
     if (!token) {
@@ -106,23 +123,6 @@ export default async function handler(req, res) {
     }
 
     const CAL_AUTH = `Bearer ${token}`;
-
-    console.log('\n🔄 Fetching invitee details from Calendly...');
-    const invRes = await fetch(inviteeUri, { 
-      headers: { Authorization: CAL_AUTH } 
-    });
-    
-    if (!invRes.ok) {
-      const errText = await invRes.text().catch(() => '');
-      console.error(`❌ Calendly invitee API error ${invRes.status}:`, errText);
-      throw new Error(`Calendly invitee error ${invRes.status}`);
-    }
-    
-    const invData = await invRes.json();
-    const invitee = invData.resource;
-    const email = invitee.email;
-
-    console.log(`✅ Invitee email: ${email}`);
 
     console.log('\n🔄 Fetching event details from Calendly...');
     const evtRes = await fetch(eventUri, { 
@@ -140,12 +140,12 @@ export default async function handler(req, res) {
 
     // Extract booking details
     const startISO = event.start_time || null;
-    const tz = invitee.timezone || event.timezone || 'UTC';
+    const eventTz = event.timezone || timezone;
     
     let startLocal = null;
     if (startISO) {
       try {
-        startLocal = new Date(startISO).toLocaleString('en-GB', { timeZone: tz });
+        startLocal = new Date(startISO).toLocaleString('en-GB', { timeZone: eventTz });
       } catch (e) {
         console.warn('⚠️  Could not format local time:', e.message);
       }
@@ -154,20 +154,27 @@ export default async function handler(req, res) {
     // Extract date in YYYY-MM-DD format for Salesforce
     const surveyDate = startISO ? String(startISO).slice(0, 10) : null;
 
-    // Extract payment information
-    const payment = invitee.payment || null;
-    const paid = !!(payment && (payment.amount || payment.external_id || payment.provider));
-    const amount = payment?.amount ?? null;
-    const currency = payment?.currency ?? null;
+    // Extract payment information from payload
+    const questions = payload.questions_and_answers || [];
+    const paymentQuestion = questions.find(q => 
+      q.question && q.question.toLowerCase().includes('payment')
+    );
+    
+    // Check for payment in multiple locations
+    const paid = !!(
+      payload.payment || 
+      (paymentQuestion && paymentQuestion.answer) ||
+      payload.paid === true ||
+      payload.payment_status === 'paid'
+    );
 
     console.log('\n📊 Booking Details:');
+    console.log(`  Email: ${email}`);
     console.log(`  Start Time (ISO): ${startISO}`);
     console.log(`  Start Time (Local): ${startLocal}`);
     console.log(`  Survey Date: ${surveyDate}`);
     console.log(`  Payment Received: ${paid ? 'Yes' : 'No'}`);
-    if (paid) {
-      console.log(`  Amount: ${amount} ${currency}`);
-    }
+    console.log(`  Timezone: ${eventTz}`);
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SALESFORCE AUTH
@@ -283,10 +290,8 @@ export default async function handler(req, res) {
         email,
         surveyDate,
         paid,
-        amount,
-        currency,
         startTime: startISO,
-        eventTimezone: tz,
+        eventTimezone: eventTz,
         startTimeLocal: startLocal
       });
     }
@@ -323,10 +328,8 @@ export default async function handler(req, res) {
         leadId,
         surveyDate,
         paid,
-        amount,
-        currency,
         startTime: startISO,
-        eventTimezone: tz,
+        eventTimezone: eventTz,
         startTimeLocal: startLocal
       });
     }
@@ -344,10 +347,8 @@ export default async function handler(req, res) {
       email,
       surveyDate,
       paid,
-      amount,
-      currency,
       startTime: startISO,
-      eventTimezone: tz,
+      eventTimezone: eventTz,
       startTimeLocal: startLocal,
       message: 'Lead updated successfully'
     });
