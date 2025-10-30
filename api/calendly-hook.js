@@ -249,7 +249,14 @@ export default async function handler(req, res) {
 
     let leadId = null;
     let leadName = null;
-    const maxAttempts = 5;
+    
+    // Strategy for Vercel Free 10s timeout:
+    // Wait 6 seconds initially for Salesforce indexing, then 3 quick attempts
+    // Total: 6s + 3s = ~9 seconds (within 10s limit)
+    console.log('⏳ Waiting 6 seconds for Salesforce indexing...');
+    await new Promise(resolve => setTimeout(resolve, 6000));
+    
+    const maxAttempts = 3;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       console.log(`  Attempt ${attempt}/${maxAttempts}...`);
@@ -274,19 +281,18 @@ export default async function handler(req, res) {
         break;
       }
 
-      // If not found and more attempts remain, wait before retry
+      // If not found and more attempts remain, wait 1s before retry
       if (attempt < maxAttempts) {
-        const delayMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s, 16s
-        console.log(`  ⏳ Lead not found, waiting ${delayMs}ms before retry...`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
+        console.log(`  ⏳ Lead not found, waiting 1s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
 
     if (!leadId) {
-      console.error(`❌ Lead not found after ${maxAttempts} attempts`);
+      console.error(`❌ Lead not found after 6s initial delay + ${maxAttempts} attempts`);
       return json(res, 404, {
         ok: false,
-        error: `Lead not found by email after ${maxAttempts} attempts`,
+        error: `Lead not found by email after 6s delay + ${maxAttempts} attempts`,
         email,
         surveyDate,
         paid,
