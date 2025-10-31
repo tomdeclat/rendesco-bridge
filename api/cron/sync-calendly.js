@@ -1,9 +1,9 @@
 // /api/cron/sync-calendly.js
+// PRODUCTION VERSION - Updated Oct 31, 2025
 // Vercel Cron Job: Runs every 10 minutes to sync Calendly bookings with Salesforce leads
-// Handles cases where the immediate webhook failed due to Salesforce indexing delays
 
 export const config = {
-  maxDuration: 300, // 5 minutes max (Pro plan allows up to 300s, Free allows 10s per invocation)
+  maxDuration: 300, // 5 minutes max
 };
 
 function json(res, code, obj) {
@@ -14,12 +14,12 @@ function json(res, code, obj) {
 
 export default async function handler(req, res) {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('⏰ Calendly-Salesforce Sync Cron Job Started');
+  console.log('⏰ Calendly-Salesforce Sync Cron Job Started (PRODUCTION)');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(`Triggered at: ${new Date().toISOString()}`);
 
   try {
-    // Verify cron secret (prevent unauthorized access)
+    // Verify cron secret
     const cronSecret = req.headers['authorization'];
     const expectedSecret = process.env.CRON_SECRET;
     
@@ -29,11 +29,11 @@ export default async function handler(req, res) {
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // CALENDLY API - Fetch recent bookings (last 24 hours)
+    // CALENDLY API
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const calendlyToken = (process.env.CALENDLY_PAT || '').trim();
     if (!calendlyToken) {
-      console.error('❌ Missing CALENDLY_PAT environment variable');
+      console.error('❌ Missing CALENDLY_PAT');
       return json(res, 500, { ok: false, error: 'Missing CALENDLY_PAT' });
     }
 
@@ -48,7 +48,7 @@ export default async function handler(req, res) {
     twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
     const minStartTime = twentyFourHoursAgo.toISOString();
 
-    console.log(`\n🔍 Fetching Calendly bookings since: ${minStartTime}`);
+    console.log(`\n🔍 Fetching bookings since: ${minStartTime}`);
 
     const eventsUrl = `https://api.calendly.com/scheduled_events?organization=${encodeURIComponent(organizationUri)}&min_start_time=${encodeURIComponent(minStartTime)}&status=active&count=100`;
     
@@ -73,9 +73,9 @@ export default async function handler(req, res) {
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // SALESFORCE AUTHENTICATION
+    // SALESFORCE AUTHENTICATION (PRODUCTION)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    console.log('\n🔐 Authenticating with Salesforce...');
+    console.log('\n🔐 Authenticating with Salesforce Production...');
 
     const {
       SF_INSTANCE_URL,
@@ -137,7 +137,7 @@ export default async function handler(req, res) {
     const base = tok.instance_url || SF_INSTANCE_URL;
 
     if (!access_token || !base) {
-      console.error('❌ Missing Salesforce access_token or instance_url');
+      console.error('❌ Missing access_token or instance_url');
       throw new Error('Failed to authenticate with Salesforce');
     }
 
@@ -162,7 +162,7 @@ export default async function handler(req, res) {
       });
 
       if (!inviteesRes.ok) {
-        console.error(`❌ Failed to fetch invitees for event`);
+        console.error(`❌ Failed to fetch invitees`);
         errorCount++;
         continue;
       }
@@ -181,12 +181,9 @@ export default async function handler(req, res) {
           continue;
         }
 
-        console.log(`  📧 Processing invitee: ${email}`);
+        console.log(`  📧 Processing: ${email}`);
 
-        // Extract payment status
         const paid = payment?.successful === true;
-        
-        // Extract survey date from event start_time (ISO format)
         const surveyDate = startTime ? startTime.split('T')[0] : '';
 
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -210,7 +207,7 @@ export default async function handler(req, res) {
         const lead = q?.records?.[0];
 
         if (!lead) {
-          console.log(`  ⚠️  Lead not found for email: ${email}`);
+          console.log(`  ⚠️  Lead not found for: ${email}`);
           skippedCount++;
           continue;
         }
@@ -218,25 +215,27 @@ export default async function handler(req, res) {
         const leadId = lead.Id;
         const leadName = `${lead.FirstName || ''} ${lead.LastName || ''}`.trim();
 
-        // Check if lead already has survey data
+        // Check if already has survey data
         if (lead.Survey_scheduled__c && lead.Survey_payment_complete__c) {
-          console.log(`  ✓ Lead ${leadName} (${leadId}) already has survey data - skipping`);
+          console.log(`  ✓ Lead ${leadName} already has survey data - skipping`);
           skippedCount++;
           continue;
         }
 
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        // UPDATE LEAD WITH BOOKING DATA
+        // UPDATE LEAD (PRODUCTION FIELDS)
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         console.log(`  📝 Updating lead ${leadName} (${leadId})...`);
 
         const patchUrl = `${base}/services/data/${apiVersion}/sobjects/Lead/${leadId}`;
+        
+        // PRODUCTION: Using field API names
         const patchBody = {
           Survey_scheduled__c: surveyDate || "",
           Survey_payment_complete__c: !!paid
         };
 
-        console.log(`  Update payload:`, patchBody);
+        console.log(`  Payload:`, patchBody);
 
         const pRes = await fetch(patchUrl, {
           method: 'PATCH',
@@ -249,7 +248,7 @@ export default async function handler(req, res) {
 
         if (!pRes.ok) {
           const errText = await pRes.text().catch(() => '');
-          console.error(`  ❌ SF update error ${pRes.status}:`, errText);
+          console.error(`  ❌ SF update error ${pRes.status}:`, errText.slice(0, 200));
           errorCount++;
           continue;
         }
